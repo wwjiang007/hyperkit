@@ -4,14 +4,13 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"strconv"
 	"strings"
 
-	"github.com/docker/hyperkit/go"
+	"github.com/moby/hyperkit/go"
 )
 
 func stringToIntArray(l string, sep string) ([]int, error) {
@@ -33,7 +32,10 @@ func main() {
 	hk := flag.String("hyperkit", "", "HyperKit binary to use")
 	statedir := flag.String("state", "", "Directory to keep state in")
 	vpnkitsock := flag.String("vpnkitsock", "auto", "Path to VPNKit socket")
-	disk := flag.String("disk", "", "Path to disk image")
+	vpnkituuid := flag.String("vpnkituuid", "", "VPNKit UUID. Allows VMs to reconnect and get the same network configuration.")
+	vpnkitip := flag.String("vpnkitip", "", "Preferred IPv4 address in VPNKit range. Requires an unused UUID.")
+	var disks disks
+	flag.Var(&disks, "disk", "Can be specified multiple times. Format: {file=}PATH{,size=SIZE_IN_MB} or just size=SIZE_IN_MB if -state is set. If PATH doesn't exist and size is specified the image will automatically be created.")
 
 	kernel := flag.String("kernel", "", "Kernel to boot")
 	initrd := flag.String("initrd", "", "Initial RAM Disk")
@@ -42,9 +44,10 @@ func main() {
 
 	cpus := flag.Int("cpus", 1, "Number of CPUs")
 	mem := flag.Int("mem", 1024, "Amount of memory in MB")
-	diskSz := flag.Int("disk-size", 0, "Size of Disk in MB")
 	vsock := flag.Bool("vsock", false, "Enable virtio-sockets")
 	vsockports := flag.String("vsock-ports", "", "Comma separated list of ports to expose as sockets from guest")
+
+	_9psock := flag.String("9p-socket", "", "9P unix domain socket to forward to the guest. Format: socket_path,9p_tag")
 
 	iso := flag.String("iso", "", "ISO image to pass to the VM (not for booting from)")
 
@@ -52,32 +55,7 @@ func main() {
 	cmd := flag.Args()
 
 	if len(cmd) != 0 {
-		if *statedir == "" {
-			log.Fatalln("Specify existing state directory for: ", cmd[0])
-		}
-		h, err := hyperkit.FromState(*statedir)
-		if err != nil {
-			log.Fatalln("Error getting hyperkit: ", err)
-		}
-		switch cmd[0] {
-		case "info":
-			fmt.Println("Running: ", h.IsRunning())
-			s, _ := json.MarshalIndent(h, "", "  ")
-			fmt.Println(string(s))
-			return
-		case "stop", "kill":
-			err := h.Stop()
-			if err != nil {
-				log.Fatalln("Error stopping hyperkit: ", err)
-			}
-			err = h.Remove(*disk != "")
-			if err != nil {
-				log.Fatalln("Error removing state: ", err)
-			}
-			return
-		default:
-			log.Fatalln("Unknown command: ", cmd[0])
-		}
+		log.Fatalf("Unexpected arguments: %v", cmd)
 	}
 
 	h, err := hyperkit.New(*hk, *vpnkitsock, *statedir)
@@ -90,7 +68,6 @@ func main() {
 
 	h.CPUs = *cpus
 	h.Memory = *mem
-	h.DiskSize = *diskSz
 	h.VSock = *vsock
 	if h.VSock {
 		ports, err := stringToIntArray(*vsockports, ",")
@@ -99,12 +76,26 @@ func main() {
 		}
 		h.VSockPorts = ports
 	}
-	h.DiskImage = *disk
-	h.ISOImage = *iso
+	if *iso != "" {
+		h.ISOImages = []string{*iso}
+	}
+
+	h.Disks = disks
+
+	if *_9psock != "" {
+		p := strings.Split(*_9psock, ",")
+		if len(p) != 2 {
+			log.Fatalln("9psock requires two parameters: path,tag")
+		}
+		h.Sockets9P = []hyperkit.Socket9P{{Path: p[0], Tag: p[1]}}
+	}
+
+	h.VPNKitUUID = *vpnkituuid
+	h.VPNKitPreferredIPv4 = *vpnkitip
 
 	if *bg {
 		h.Console = hyperkit.ConsoleFile
-		err = h.Start("console=ttyS0")
+		_, err = h.Start("console=ttyS0")
 
 	} else {
 		err = h.Run("console=ttyS0")
@@ -114,5 +105,41 @@ func main() {
 		fmt.Println(h.Arguments)
 		log.Fatalln("Error creating hyperkit: ", err)
 	}
+}
 
+type disks []hyperkit.Disk
+
+func (d *disks) String() string {
+	return fmt.Sprintf("%v", *d)
+}
+
+// Set parses a string with a disk configuration passed as a command line option.
+func (d *disks) Set(v string) error {
+	if v == "" {
+		return fmt.Errorf("Empty disk config")
+	}
+
+	var disk hyperkit.RawDisk
+	for _, kv := range strings.Split(v, ",") {
+		p := strings.SplitN(kv, "=", 2)
+		if len(p) == 1 { // Assume no key is a path
+			p = []string{"file", kv}
+		}
+		switch p[0] {
+		case "size":
+			var err error
+			if disk.Size, err = strconv.Atoi(p[1]); err != nil {
+				return err
+			}
+		case "file":
+			if disk.Path != "" {
+				return fmt.Errorf("Invalid disk config, path already set")
+			}
+			disk.Path = p[1]
+		default:
+			return fmt.Errorf("Unrecognised disk config key: %s", p[0])
+		}
+	}
+	*d = append(*d, &disk)
+	return nil
 }

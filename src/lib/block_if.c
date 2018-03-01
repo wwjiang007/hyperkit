@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/disk.h>
+#include <sys/mount.h>
 
 #include <assert.h>
 #include <fcntl.h>
@@ -52,6 +53,14 @@
 #include "mirage_block_c.h"
 
 #define BLOCKIF_SIG	0xb109b109
+
+#ifndef ALIGNUP
+#define ALIGNUP(x, a) (((x - 1) & ~(a - 1)) + a)
+#endif
+
+#ifndef ALIGNDOWN
+#define ALIGNDOWN(x, a) (-(a) & (x))
+#endif
 
 /* xhyve: FIXME
  *
@@ -101,6 +110,8 @@ struct blockif_ctxt {
 	off_t			bc_size;
 	int			bc_sectsz;
 	int			bc_psectsz;
+	size_t			bc_delete_alignment; /* f_bsize always a power of 2 */
+	void*       		bc_delete_zero_buf;
 	int			bc_psectoff;
 	int			bc_closing;
 	pthread_t		bc_btid[BLOCKIF_NUMTHR];
@@ -211,6 +222,7 @@ static int
 block_delete(struct blockif_ctxt *bc, off_t offset, off_t len)
 {
 	int ret = -1;
+
 #ifdef __FreeBSD__
 	off_t arg[2] = { offset, len };
 #endif
@@ -221,22 +233,65 @@ block_delete(struct blockif_ctxt *bc, off_t offset, off_t len)
 		errno = EOPNOTSUPP;
 	else if (bc->bc_rdonly)
 		errno = EROFS;
-	if (bc->bc_fd >= 0) {
-		if (bc->bc_ischr) {
-#ifdef __FreeBSD__
-			ret = ioctl(bc->bc_fd, DIOCGDELETE, arg);
-#else
-			errno = EOPNOTSUPP;
-#endif
-		} else
-			errno = EOPNOTSUPP;
 #ifdef HAVE_OCAML_QCOW
-	} else if (bc->bc_mbh >= 0) {
+	if (bc->bc_mbh >= 0) {
 		ret = mirage_block_delete(bc->bc_mbh, offset, len);
+		goto out;
+	}
 #endif
-	} else
-		abort();
+#ifdef __FreeBSD__
+	if ((bc->bc_fd >= 0) && (bc->bc_ischr)) {
+		ret = ioctl(bc->bc_fd, DIOCGDELETE, arg);
+		errno = EOPNOTSUPP;
+		goto out;
+	}
+#elif __APPLE__
+	if (bc->bc_fd >= 0) {
+		/* PUNCHHOLE lengths and offsets have to be aligned so explicitly write zeroes
+		   into the unaligned parts at the beginning and the end. This wouldn't be necessary
+		   if the host and guest had the same sector size */
+		assert (offset >= 0);
+		assert (len >= 0);
+		size_t fp_offset = (size_t) offset;
+		size_t fp_length = (size_t) len;
 
+		size_t aligned_offset = ALIGNUP(fp_offset, bc->bc_delete_alignment);
+		if (aligned_offset != fp_offset) {
+			size_t len_to_zero = MIN(fp_length, aligned_offset - fp_offset);
+			assert(len_to_zero < bc->bc_delete_alignment);
+			ssize_t written = pwrite(bc->bc_fd, bc->bc_delete_zero_buf,
+				len_to_zero, (off_t)fp_offset);
+			if (written == -1) goto out;
+			fp_offset += len_to_zero;
+			fp_length -= len_to_zero;
+		}
+		size_t aligned_length = ALIGNDOWN(fp_length, bc->bc_delete_alignment);
+		if (aligned_length >= bc->bc_delete_alignment) {
+			assert(fp_offset % bc->bc_delete_alignment == 0);
+			struct fpunchhole arg = {
+				.fp_flags = 0,
+				.reserved = 0,
+				.fp_offset = (off_t)fp_offset,
+				.fp_length = (off_t)aligned_length
+			};
+			int punched = fcntl(bc->bc_fd, F_PUNCHHOLE, &arg);
+			if (punched == -1) goto out;
+			fp_offset += aligned_length;
+			fp_length -= aligned_length;
+		}
+		if (fp_length > 0) {
+			assert(fp_length < bc->bc_delete_alignment);
+			assert(fp_offset % bc->bc_delete_alignment == 0);
+			ssize_t written = pwrite(bc->bc_fd, bc->bc_delete_zero_buf,
+				fp_length, (off_t)fp_offset);
+			if (written == -1) goto out;
+		}
+		ret = 0;
+	}
+#else
+	errno = EOPNOTSUPP;
+#endif
+out:
 	HYPERKIT_BLOCK_DELETE_DONE(offset, ret);
 	return ret;
 }
@@ -554,15 +609,19 @@ blockif_open(const char *optstr, const char *ident)
 	char *nopt, *xopts, *cp;
 	struct blockif_ctxt *bc;
 	struct stat sbuf;
+	struct statfs fsbuf;
 	// struct diocgattr_arg arg;
 	off_t size, psectsz, psectoff, blocks;
 	int extra, fd, i, sectsz;
+	size_t delete_alignment;
+	void *delete_zero_buf;
 	int nocache, sync, ro, candelete, geom, ssopt, pssopt;
 	mirage_block_handle mbh;
 	int use_mirage = 0;
 
 #ifdef HAVE_OCAML_QCOW
 	char *mirage_qcow_config = NULL;
+	char *mirage_qcow_stats_config = NULL;
 	struct mirage_block_stat msbuf;
 #endif
 
@@ -597,6 +656,8 @@ blockif_open(const char *optstr, const char *ident)
 			use_mirage = 1;
 		else if (strncmp(cp, "qcow-config=", 12) == 0)
 			mirage_qcow_config = cp + 12;
+		else if (strncmp(cp, "qcow-stats-config=", 18) == 0)
+			mirage_qcow_stats_config = cp + 18;
 #endif
 		else if (sscanf(cp, "sectorsize=%d/%d", &ssopt, &pssopt) == 2)
 			;
@@ -618,11 +679,13 @@ blockif_open(const char *optstr, const char *ident)
 		extra |= O_SYNC;
 
 	candelete = 0;
+	sectsz = DEV_BSIZE;
+	delete_alignment = DEV_BSIZE;
 
 	if (use_mirage) {
 #ifdef HAVE_OCAML_QCOW
 		mirage_block_register_thread();
-		mbh = mirage_block_open(nopt, mirage_qcow_config);
+		mbh = mirage_block_open(nopt, mirage_qcow_config, mirage_qcow_stats_config);
 		if (mbh < 0) {
 			perror("Could not open mirage-block device");
 			goto err;
@@ -647,12 +710,43 @@ blockif_open(const char *optstr, const char *ident)
 			perror("Could not open backing file");
 			goto err;
 		}
-
+		/* Lock the file to prevent concurrent write+write or read+write as this
+		   would usually lead to corruption */
+		if (flock(fd, LOCK_NB | (ro ? LOCK_SH : LOCK_EX)) < 0) {
+			perror("Could not lock backing file");
+			goto err;
+		}
 		if (fstat(fd, &sbuf) < 0) {
 			perror("Could not stat backing file");
 			goto err;
 		}
+		if (fstatfs(fd, &fsbuf) < 0) {
+			perror("Could not stat backfile file filesystem");
+			goto err;
+		}
+		delete_alignment = (size_t)fsbuf.f_bsize;
+#ifdef __APPLE__
+		{
+			/* Check to see whether we can use F_PUNCHHOLE on this file */
+			struct fpunchhole arg = { .fp_flags = 0, .reserved = 0, .fp_offset = 0, .fp_length = 0 };
+			if (fcntl(fd, F_PUNCHHOLE, &arg) == 0) {
+				/* Sparse files are supported: enable TRIM */
+				candelete = 1;
+			} else {
+				perror("fcntl(F_PUNCHHOLE) failed: host filesystem does not support sparse files");
+				candelete = 0;
+			}
+		}
+#endif
 	}
+	/* delete_alignment is a power of 2 allowing us to use ALIGNDOWN for rounding */
+	assert((delete_alignment & (delete_alignment - 1)) == 0);
+
+	if ((delete_zero_buf = malloc(delete_alignment)) == NULL){
+		perror("Failed to allocate zeroed buffer for unaligned deletes");
+		goto err;
+	}
+	bzero(delete_zero_buf, delete_alignment);
 
 	/* One and only one handle */
 	assert(mbh >= 0 || fd >= 0);
@@ -661,7 +755,6 @@ blockif_open(const char *optstr, const char *ident)
 	 * Deal with raw devices
 	 */
 	size = sbuf.st_size;
-	sectsz = DEV_BSIZE;
 	psectsz = psectoff = 0;
 	geom = 0;
 	if (S_ISCHR(sbuf.st_mode)) {
@@ -746,6 +839,8 @@ blockif_open(const char *optstr, const char *ident)
 	bc->bc_sectsz = sectsz;
 	bc->bc_psectsz = (int)psectsz;
 	bc->bc_psectoff = (int)psectoff;
+	bc->bc_delete_alignment = delete_alignment;
+	bc->bc_delete_zero_buf = delete_zero_buf;
 	pthread_mutex_init(&bc->bc_mtx, NULL);
 	pthread_cond_init(&bc->bc_cond, NULL);
 	TAILQ_INIT(&bc->bc_freeq);

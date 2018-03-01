@@ -40,6 +40,7 @@ HYPERKIT_LIB_SRC := \
 	src/lib/block_if.c \
 	src/lib/consport.c \
 	src/lib/dbgport.c \
+	src/lib/fwctl.c \
 	src/lib/inout.c \
 	src/lib/ioapic.c \
 	src/lib/md5c.c \
@@ -76,7 +77,7 @@ FIRMWARE_LIB_SRC := \
 
 HYPERKIT_SRC := src/hyperkit.c
 
-HAVE_OCAML_QCOW := $(shell if ocamlfind query qcow uri logs logs.fmt mirage-unix >/dev/null 2>/dev/null ; then echo YES ; else echo NO; fi)
+HAVE_OCAML_QCOW := $(shell if ocamlfind query qcow prometheus-app uri logs logs.fmt mirage-unix >/dev/null 2>/dev/null ; then echo YES ; else echo NO; fi)
 
 ifeq ($(HAVE_OCAML_QCOW),YES)
 CFLAGS += -DHAVE_OCAML=1 -DHAVE_OCAML_QCOW=1 -DHAVE_OCAML=1
@@ -105,15 +106,15 @@ OCAML_C_SRC := \
 OCAML_WHERE := $(shell ocamlc -where)
 OCAML_PACKS := cstruct cstruct.lwt io-page io-page.unix uri mirage-block \
 	mirage-block-unix qcow unix threads lwt lwt.unix logs logs.fmt   \
-	mirage-unix
+	mirage-unix prometheus-app conduit-lwt cohttp.lwt
 OCAML_LDLIBS := -L $(OCAML_WHERE) \
 	$(shell ocamlfind query cstruct)/cstruct.a \
 	$(shell ocamlfind query cstruct)/libcstruct_stubs.a \
 	$(shell ocamlfind query io-page)/io_page.a \
-	$(shell ocamlfind query io-page)/io_page_unix.a \
-	$(shell ocamlfind query io-page)/libio_page_unix_stubs.a \
-	$(shell ocamlfind query lwt.unix)/liblwt-unix_stubs.a \
-	$(shell ocamlfind query lwt.unix)/lwt-unix.a \
+	$(shell ocamlfind query io-page-unix)/io_page_unix.a \
+	$(shell ocamlfind query io-page-unix)/libio_page_unix_stubs.a \
+	$(shell ocamlfind query lwt.unix)/liblwt_unix_stubs.a \
+	$(shell ocamlfind query lwt.unix)/lwt_unix.a \
 	$(shell ocamlfind query lwt.unix)/lwt.a \
 	$(shell ocamlfind query threads)/libthreadsnat.a \
 	$(shell ocamlfind query mirage-block-unix)/libmirage_block_unix_stubs.a \
@@ -191,3 +192,25 @@ test: $(TARGET) test/vmlinuz test/initrd.gz
 
 test-qcow: $(TARGET) test/vmlinuz test/initrd.gz
 	@(cd test && ./test_linux_qcow.exp)
+
+
+## ----------- ##
+## Artifacts.  ##
+## ----------- ##
+
+.PHONY: artifacts
+artifacts: build/LICENSE build/COMMIT
+
+.PHONY: build/LICENSE
+build/LICENSE:
+	@echo "  GEN     " $@
+	@find src -type f | xargs awk '/^\/\*-/{p=1;print FILENAME ":";print;next} p&&/^.*\*\//{print;print "";p=0};p' > $@.tmp
+	@opam config exec -- make -C repo list-licenses
+	@cat repo/OCAML-LICENSES >> $@.tmp
+	@mv $@.tmp $@
+
+.PHONY: build/COMMIT
+build/COMMIT:
+	@echo "  GEN     " $@
+	@git rev-parse HEAD > $@.tmp
+	@mv $@.tmp $@
